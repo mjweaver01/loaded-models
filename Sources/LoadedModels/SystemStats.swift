@@ -32,23 +32,37 @@ enum GPUReader {
     }
 }
 
+struct ProcessUsage: Equatable {
+    var cpuPercent: Double
+    var residentBytes: UInt64
+}
+
+/// LM Studio runs each loaded model in its own process: MLX models in a node `llmworker`, GGUF models in `llama-server`.
+enum ModelProcessKind: Equatable {
+    case mlxWorker
+    case llamaServer(modelPath: String)
+}
+
 struct RuntimeStats {
     var cpuPercent: Double = 0
     var residentBytes: UInt64 = 0
     var lmStudioRunning = false
     var ollamaRunning = false
+    var processes: [pid_t: ProcessUsage] = [:]
+    var modelProcesses: [pid_t: ModelProcessKind] = [:]
 }
 
 /// Samples CPU and memory of local LLM runtime processes (LM Studio, Ollama, llama.cpp).
 final class RuntimeProcessSampler {
     private var lastCPU: [pid_t: UInt64] = [:]
     private var lastTime: UInt64 = 0
+    private var kindCache: [pid_t: ModelProcessKind?] = [:]
     private let cores = Double(ProcessInfo.processInfo.activeProcessorCount)
 
     private enum Runtime { case lmStudio, ollama, other }
 
     private static func runtime(for path: String) -> Runtime? {
-        // The lms CLI (including our own log stream) is a client, not the runtime.
+        // The lms CLI (including our own log streams) is a client, not the runtime.
         if path == ModelSources.lmsPath { return nil }
         if path.contains("/LM Studio.app/") || path.contains("/.lmstudio/") { return .lmStudio }
         if path.hasSuffix("/ollama") || path.contains("/Ollama.app/") { return .ollama }
@@ -58,6 +72,7 @@ final class RuntimeProcessSampler {
 
     func sample() -> RuntimeStats {
         let now = mach_absolute_time()
+        let elapsed = lastTime == 0 || now <= lastTime ? 0 : Double(now - lastTime)
         var pids = [pid_t](repeating: 0, count: 8192)
         let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.stride)))
         var pathBuffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
@@ -67,9 +82,9 @@ final class RuntimeProcessSampler {
         var deltaTicks: UInt64 = 0
 
         for pid in pids.prefix(max(0, count)) where pid > 0 {
-            guard proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count)) > 0,
-                  let runtime = Self.runtime(for: String(cString: pathBuffer))
-            else { continue }
+            guard proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count)) > 0 else { continue }
+            let path = String(cString: pathBuffer)
+            guard let runtime = Self.runtime(for: path) else { continue }
 
             switch runtime {
             case .lmStudio: stats.lmStudioRunning = true
@@ -85,17 +100,66 @@ final class RuntimeProcessSampler {
             let total = info.pti_total_user + info.pti_total_system
             cpu[pid] = total
             stats.residentBytes += info.pti_resident_size
+            var delta: UInt64 = 0
             if let previous = lastCPU[pid], total >= previous {
-                deltaTicks += total - previous
+                delta = total - previous
+                deltaTicks += delta
+            }
+            stats.processes[pid] = ProcessUsage(
+                cpuPercent: elapsed > 0 ? min(100, Double(delta) / elapsed / cores * 100) : 0,
+                residentBytes: info.pti_resident_size
+            )
+
+            if runtime == .lmStudio, let kind = modelProcessKind(pid: pid, path: path) {
+                stats.modelProcesses[pid] = kind
             }
         }
 
-        if lastTime != 0, now > lastTime {
-            stats.cpuPercent = min(100, Double(deltaTicks) / Double(now - lastTime) / cores * 100)
+        if elapsed > 0 {
+            stats.cpuPercent = min(100, Double(deltaTicks) / elapsed / cores * 100)
         }
         lastCPU = cpu
         lastTime = now
+        kindCache = kindCache.filter { cpu[$0.key] != nil }
         return stats
+    }
+
+    private func modelProcessKind(pid: pid_t, path: String) -> ModelProcessKind? {
+        if let cached = kindCache[pid] { return cached }
+        var kind: ModelProcessKind?
+        if path.hasSuffix("/llama-server") {
+            let args = Self.arguments(of: pid) ?? []
+            if let index = args.firstIndex(of: "--model"), index + 1 < args.count {
+                kind = .llamaServer(modelPath: args[index + 1])
+            }
+        } else if path.hasSuffix("/node"), Self.arguments(of: pid)?.contains(where: { $0.contains("llmworker.js") }) == true {
+            kind = .mlxWorker
+        }
+        kindCache[pid] = kind
+        return kind
+    }
+
+    /// Reads a process's argv via sysctl(KERN_PROCARGS2), which works for our own user's processes.
+    static func arguments(of pid: pid_t) -> [String]? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return nil }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0 else { return nil }
+
+        // Layout: argc (Int32), exec path, NUL padding, then argc NUL-terminated arguments.
+        let argc = buffer.withUnsafeBytes { $0.load(as: Int32.self) }
+        var index = MemoryLayout<Int32>.size
+        while index < size, buffer[index] != 0 { index += 1 }
+        while index < size, buffer[index] == 0 { index += 1 }
+        var args: [String] = []
+        while args.count < argc, index < size {
+            let start = index
+            while index < size, buffer[index] != 0 { index += 1 }
+            args.append(String(decoding: buffer[start..<index], as: UTF8.self))
+            index += 1
+        }
+        return args
     }
 }
 

@@ -7,8 +7,10 @@ struct LoadedModel: Identifiable, Equatable {
     }
 
     let id: String
+    let identifier: String
     let name: String
     let source: Source
+    let path: String?
     let detail: String
     let sizeBytes: UInt64?
     let contextLength: Int?
@@ -47,6 +49,7 @@ enum ModelSources {
         let identifier: String?
         let modelKey: String
         let displayName: String?
+        let path: String?
         let sizeBytes: UInt64?
         let paramsString: String?
         let architecture: String?
@@ -77,8 +80,10 @@ enum ModelSources {
             let status = entry.status ?? "idle"
             return LoadedModel(
                 id: "lms:" + (entry.identifier ?? entry.modelKey),
+                identifier: entry.identifier ?? entry.modelKey,
                 name: entry.displayName ?? entry.modelKey,
                 source: .lmStudio,
+                path: entry.path,
                 detail: detail,
                 sizeBytes: entry.sizeBytes,
                 contextLength: entry.contextLength,
@@ -128,8 +133,10 @@ enum ModelSources {
         return response.models.map { model in
             LoadedModel(
                 id: "ollama:" + model.name,
+                identifier: model.name,
                 name: model.name,
                 source: .ollama,
+                path: nil,
                 detail: [model.details?.parameter_size, model.details?.quantization_level]
                     .compactMap { $0 }
                     .joined(separator: " · "),

@@ -81,7 +81,7 @@ struct ModelList: View {
                 .padding(.vertical, 6)
         } else {
             VStack(spacing: 10) {
-                ForEach(monitor.models) { ModelRow(model: $0, throughput: monitor.throughput(for: $0)) }
+                ForEach(monitor.models) { ModelRow(model: $0, stats: monitor.stats(for: $0)) }
             }
         }
     }
@@ -89,7 +89,7 @@ struct ModelList: View {
 
 struct ModelRow: View {
     let model: LoadedModel
-    let throughput: ModelThroughput?
+    let stats: ModelStats
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -106,21 +106,39 @@ struct ModelRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                if let throughput {
-                    ThroughputLine(throughput: throughput)
+                if let progress = stats.promptProgress {
+                    ProgressView(value: min(progress, 100), total: 100)
+                        .progressViewStyle(.linear)
+                        .tint(.orange)
+                        .controlSize(.mini)
+                        .padding(.vertical, 2)
+                }
+                if stats.throughput != nil || stats.liveTokensPerSecond != nil {
+                    ThroughputLine(throughput: stats.throughput, live: stats.liveTokensPerSecond)
                 }
             }
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 2) {
-                if let size = model.sizeBytes {
-                    Text(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .memory))
+                if let memory {
+                    Text(memory)
                         .font(.system(size: 12).monospacedDigit())
+                        .help(stats.usage == nil ? "Size on disk" : "Memory used by this model's process")
+                }
+                if let usage = stats.usage {
+                    Text(String(format: "%.0f%% CPU", usage.cpuPercent))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
                 }
                 Text(status)
                     .font(.caption)
-                    .foregroundStyle(model.isActive ? .green : .secondary)
+                    .foregroundStyle(statusColor)
             }
         }
+    }
+
+    private var memory: String? {
+        guard let bytes = stats.usage?.residentBytes ?? model.sizeBytes else { return nil }
+        return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .memory)
     }
 
     private var subtitle: String {
@@ -131,27 +149,45 @@ struct ModelRow: View {
     }
 
     private var status: String {
+        if let progress = stats.promptProgress {
+            return String(format: "Reading prompt %.0f%%", progress)
+        }
         if model.isActive {
             return model.queued > 0 ? "Generating (+\(model.queued))" : "Generating"
         }
         guard let lastUsed = model.lastUsed else { return "Idle" }
         return "Used " + lastUsed.formatted(.relative(presentation: .named, unitsStyle: .abbreviated))
     }
+
+    private var statusColor: Color {
+        if stats.promptProgress != nil { return .orange }
+        return model.isActive ? .green : .secondary
+    }
 }
 
 struct ThroughputLine: View {
-    let throughput: ModelThroughput
+    let throughput: ModelThroughput?
+    let live: Double?
 
     var body: some View {
         HStack(spacing: 6) {
-            Label(String(format: "%.1f tok/s", throughput.last), systemImage: "bolt.fill")
-                .foregroundStyle(.teal)
-            if throughput.recent.count > 1 {
-                Text(String(format: "avg %.1f", throughput.average))
-                Sparkline(values: throughput.recent, maxValue: (throughput.recent.max() ?? 1) * 1.1, color: .teal)
-                    .frame(width: 36, height: 11)
+            if let live {
+                Label(String(format: "%.0f tok/s live", live), systemImage: "bolt.fill")
+                    .foregroundStyle(.teal)
+            } else if let throughput {
+                Label(String(format: "%.1f tok/s", throughput.last), systemImage: "bolt.fill")
+                    .foregroundStyle(.teal)
             }
-            Text(String(format: "%d tok · TTFT %.2fs", throughput.lastTokens, throughput.lastTimeToFirstToken))
+            if let throughput {
+                if throughput.recent.count > 1 {
+                    Text(String(format: "avg %.1f", throughput.average))
+                    Sparkline(values: throughput.recent, maxValue: (throughput.recent.max() ?? 1) * 1.1, color: .teal)
+                        .frame(width: 36, height: 11)
+                }
+                if live == nil {
+                    Text(String(format: "%d tok · TTFT %.2fs", throughput.lastTokens, throughput.lastTimeToFirstToken))
+                }
+            }
         }
         .font(.caption2.monospacedDigit())
         .foregroundStyle(.secondary)
